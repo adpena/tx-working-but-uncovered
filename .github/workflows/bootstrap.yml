@@ -1,0 +1,146 @@
+name: Bootstrap prepared repository
+
+on:
+  push:
+    paths:
+      - ".github/workflows/bootstrap.yml"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  publish:
+    name: Verify, reconstruct, validate, and publish
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out temporary transfer branch
+        uses: actions/checkout@v6
+
+      - name: Reconstruct and verify source bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .bootstrap/bundle.part-* | base64 --decode > /tmp/source.bundle
+          echo "0d7692104bc24a76aeacd0faad8e68f736f7db81b03b87a5c176bdaa05d3180e  /tmp/source.bundle" | sha256sum --check -
+          git bundle verify /tmp/source.bundle
+          git clone --branch main /tmp/source.bundle /tmp/source
+
+      - name: Set up pinned Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13.5"
+
+      - name: Restore deterministic review artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/source
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install --requirement requirements-dev.txt
+          .venv/bin/python -m pip check
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          .venv/bin/python dev/generate_synthetic_fixtures.py
+          git add data-synthetic demo
+          git commit -m "Restore deterministic synthetic review fixtures"
+
+      - name: Record the public release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/source
+          .venv/bin/python - <<'PY'
+          from pathlib import Path
+
+          path = Path("docs/PUBLICATION_RECORD.md")
+          text = path.read_text(encoding="utf-8")
+          replacements = {
+              "| Repository URL | |": "| Repository URL | `https://github.com/adpena/tx-working-but-uncovered` |",
+              "| Release tag / commit | |": "| Release tag / commit | `v0.2.0` |",
+              "| IPUMS extract numbers | |": "| IPUMS extract numbers | Not yet requested; this public release uses synthetic fixtures only |",
+              "| Data extraction date | |": "| Data extraction date | Not applicable for the synthetic public release |",
+              "| Flourish story URL | |": "| Flourish story URL | Not yet published |",
+              "| Flourish visualization IDs | |": "| Flourish visualization IDs | Not yet published |",
+              "| Publication date | |": "| Publication date | 2026-08-13 |",
+              "| Reviewers | |": "| Reviewers | Automated repository validator and GitHub Actions; substantive review remains pending |",
+              "| Known limitations | |": "| Known limitations | Synthetic demonstration only; production R/IPUMS execution and editorial review remain pending |",
+              "| Archived output location | |": "| Archived output location | GitHub release `v0.2.0` |",
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f"Expected publication-record field not found: {old}")
+              text = text.replace(old, new)
+          path.write_text(text, encoding="utf-8")
+          PY
+          git add docs/PUBLICATION_RECORD.md
+          git commit -m "Record public repository release"
+
+      - name: Refresh and verify validation metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/source
+          .venv/bin/python dev/validate_repository.py
+          git add validation/repository_validation.json validation/repository_validation.md
+          git commit -m "Refresh release validation metadata"
+          .venv/bin/python dev/check_fixture_reproducibility.py
+          .venv/bin/python dev/validate_repository.py --check
+          test -z "$(git status --porcelain)"
+
+      - name: Publish final history and release tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/source
+          git tag -d v0.2.0 || true
+          git tag -a v0.2.0 -m "Working, but Uncovered v0.2.0"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin main
+          git push --force origin refs/tags/v0.2.0
+
+      - name: Create GitHub release and dispatch full CI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/release-notes.md <<'EOF'
+          ## Working, but Uncovered v0.2.0
+
+          An R-first, reproducible demonstration of an IPUMS ACS research workflow for Texas health-coverage analysis.
+
+          This release includes:
+
+          - programmatic IPUMS extract definitions;
+          - ACS replicate-weight survey estimation;
+          - reliability-aware statewide, subgroup, and PUMA outputs;
+          - ArcGIS/QGIS-compatible spatial deliverables;
+          - Flourish-ready tables, GeoJSON, tooltips, and documentation;
+          - deterministic synthetic fixtures and a self-contained HTML demo;
+          - modular R, `targets`, Quarto, tests, CI, version-control, and data-governance documentation;
+          - a 45-check repository validator and byte-for-byte regeneration test.
+
+          The committed data and visual outputs are explicitly synthetic. No restricted IPUMS microdata or credentials are included. Production execution with licensed IPUMS data and substantive review remain future authorized steps.
+          EOF
+
+          if gh release view v0.2.0 --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit v0.2.0 --repo "${GITHUB_REPOSITORY}" --title "Working, but Uncovered v0.2.0" --notes-file /tmp/release-notes.md
+          else
+            gh release create v0.2.0 --repo "${GITHUB_REPOSITORY}" --verify-tag --title "Working, but Uncovered v0.2.0" --notes-file /tmp/release-notes.md
+          fi
+
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run ci.yml --repo "${GITHUB_REPOSITORY}" --ref main; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Unable to dispatch ci.yml after five attempts" >&2
+          exit 1
